@@ -1,0 +1,44 @@
+name: ci
+
+# Lint + type-check + tests on every PR and push to the main branches.
+# Mirrors the local gate: `make lint` (ruff + mypy) and `make test` (pytest).
+
+on:
+  push:
+    branches: [main, master, develop, trunk]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # requires-python = ">=3.14"; uv fetches the interpreter and locks deps.
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy .
+
+      - name: Pytest
+        run: uv run pytest
