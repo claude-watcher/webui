@@ -1,0 +1,32 @@
+name: release
+
+# Tag a version to cut a release:
+#   git tag v1.1.0 && git push origin v1.1.0
+# Publishes a GitHub Release with auto-generated notes (from the merged PRs since
+# the previous tag). Unlike the gtk/tui siblings there is no single-file asset to
+# stamp/attach: webui ships as a container/uv app and reads its version from the
+# VERSION env at runtime (main.py), so the tag itself is the source of truth.
+# GitHub attaches the source tarballs to every Release automatically.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
