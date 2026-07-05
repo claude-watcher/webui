@@ -1,4 +1,6 @@
+import json
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -38,7 +40,7 @@ async def test_meta_open(client: httpx.AsyncClient) -> None:
 
 
 async def test_sessions_open(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(detect, "scan_sessions", lambda: [{"pid": 1, "state": "idle"}])
+    monkeypatch.setattr(detect, "scan_sessions", lambda *a, **k: [{"pid": 1, "state": "idle"}])
     r = await client.get("/api/sessions")
     assert r.status_code == 200
     body = r.json()
@@ -48,18 +50,19 @@ async def test_sessions_open(client: httpx.AsyncClient, monkeypatch: pytest.Monk
 
 def test_scan_sessions_no_procs(monkeypatch: pytest.MonkeyPatch) -> None:
     # No claude processes → empty list, never raises.
-    monkeypatch.setattr(detect, "get_claude_processes", list)
+    monkeypatch.setattr(detect, "scan_proc", lambda *a, **k: ([], {}))
     assert detect.scan_sessions() == []
 
 
 def _one_proc(
     monkeypatch: pytest.MonkeyPatch,
-    state_tuple: tuple[str, int | None, str | None, str | None, float | None],
+    state_tuple: tuple[str, int | None, str | None, str | None, float | None, str | None],
+    agents: dict[str, list[dict[str, object]]] | None = None,
 ) -> None:
     monkeypatch.setattr(
         detect,
-        "get_claude_processes",
-        lambda: [{"pid": 1, "elapsed": 10, "start_unix": 0.0, "starttime": 0}],
+        "scan_proc",
+        lambda *a, **k: ([{"pid": 1, "elapsed": 10, "start_unix": 0.0, "starttime": 0}], agents or {}),
     )
     monkeypatch.setattr(detect, "get_cwd", lambda pid: "/tmp/proj")
     monkeypatch.setattr(detect, "get_env", lambda pid: {})
@@ -69,7 +72,7 @@ def _one_proc(
 def test_idle_seconds_computed_server_side(monkeypatch: pytest.MonkeyPatch) -> None:
     # idle_seconds is derived from last_activity on the server (clock-skew proof),
     # clamped to >=0, and present (>= the elapsed since last_activity).
-    _one_proc(monkeypatch, ("idle", 5, None, "topic", time.time() - 120))
+    _one_proc(monkeypatch, ("idle", 5, None, "topic", time.time() - 120, None))
     rows = detect.scan_sessions()
     assert len(rows) == 1
     assert rows[0]["idle_seconds"] is not None
@@ -77,16 +80,236 @@ def test_idle_seconds_computed_server_side(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_idle_seconds_none_without_activity(monkeypatch: pytest.MonkeyPatch) -> None:
-    _one_proc(monkeypatch, ("working", 5, "Bash", None, None))
+    _one_proc(monkeypatch, ("working", 5, "Bash", None, None, None))
     rows = detect.scan_sessions()
     assert rows[0]["idle_seconds"] is None
 
 
 def test_idle_seconds_clamped_non_negative(monkeypatch: pytest.MonkeyPatch) -> None:
     # last_activity slightly in the future (skewed statusUpdatedAt) → 0, never < 0.
-    _one_proc(monkeypatch, ("idle", 5, None, None, time.time() + 30))
+    _one_proc(monkeypatch, ("idle", 5, None, None, time.time() + 30, None))
     rows = detect.scan_sessions()
     assert rows[0]["idle_seconds"] == 0
+
+
+def test_no_agents_yields_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1"))
+    rows = detect.scan_sessions()
+    assert rows[0]["agents"] == []
+
+
+def test_agents_attached_by_parent_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Subagents keyed by the child's --parent-session-id are attached to the
+    # session whose registry sessionId matches.
+    agents = {"sess-1": [{"pid": 42, "name": "explorer", "type": "Explore", "model": "opus-4-8"}]}
+    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1"), agents=agents)
+    rows = detect.scan_sessions()
+    assert rows[0]["agents"] == agents["sess-1"]
+
+
+def test_agents_not_attached_when_session_id_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A subagent parented to a different session id is not attached here.
+    agents = {"other": [{"pid": 42, "name": "explorer", "type": None, "model": None}]}
+    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1"), agents=agents)
+    rows = detect.scan_sessions()
+    assert rows[0]["agents"] == []
+
+
+def test_daemon_row_is_minimal_and_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A daemon proc yields a minimal row flagged `daemon` with a neutral state,
+    # and the state resolver is never consulted for it.
+    monkeypatch.setattr(
+        detect,
+        "scan_proc",
+        lambda *a, **k: (
+            [{"pid": 2, "elapsed": 5, "start_unix": 0.0, "starttime": 0, "is_daemon": True}],
+            {},
+        ),
+    )
+    monkeypatch.setattr(detect, "get_cwd", lambda pid: "/tmp/proj")
+    monkeypatch.setattr(detect, "get_env", lambda pid: {})
+    rows = detect.scan_sessions()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["daemon"] is True
+    assert r["state"] == "daemon"
+    assert r["agents"] == [] and r["tool"] is None and r["context_pct"] is None
+    assert r["idle_seconds"] is None
+
+
+def test_non_daemon_row_flagged_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    _one_proc(monkeypatch, ("working", 5, "Bash", None, None, "sess-1"))
+    rows = detect.scan_sessions()
+    assert rows[0]["daemon"] is False
+
+
+def test_resolve_config_dir() -> None:
+    assert detect.resolve_config_dir({}) is None
+    assert detect.resolve_config_dir({"CLAUDE_CONFIG_DIR": "relative/dir"}) is None  # relative → None
+    assert detect.resolve_config_dir({"CLAUDE_CONFIG_DIR": "/abs/dir"}) == "/abs/dir"
+
+
+def _write_proc(root: Path, pid: int, comm: str, cmdline: bytes, *, with_stat: bool = True) -> None:
+    d = root / str(pid)
+    d.mkdir()
+    (d / "comm").write_text(comm + "\n")
+    (d / "cmdline").write_bytes(cmdline)
+    if with_stat:
+        # Fields after ") " start at the process state; index 19 = field 22 = starttime.
+        (d / "stat").write_text(f"{pid} ({comm}) S " + " ".join(["0"] * 18) + " 42")
+
+
+def test_scan_proc_classifies_sessions_daemon_and_agents(tmp_path: Path) -> None:
+    root = tmp_path
+    (root / "uptime").write_text("1000.0 500.0\n")
+    _write_proc(root, 100, "claude", b"/usr/bin/claude\x00")  # interactive session
+    _write_proc(root, 200, "claude", b"/usr/bin/claude\x00daemon\x00run\x00")  # daemon
+    _write_proc(root, 400, "kworker", b"", with_stat=False)  # kernel thread → ignored
+    _write_proc(  # subagent: comm != claude, spotted by argv tokens
+        root,
+        300,
+        "1.2.3",
+        b"/usr/bin/claude-1.2.3\x00--agent-id\x00foo@team\x00--parent-session-id\x00sess-1"
+        b"\x00--agent-name\x00explorer\x00--agent-type\x00Explore\x00--model\x00claude-opus-4-8\x00",
+        with_stat=False,
+    )
+
+    procs, agents = detect.scan_proc(proc_root=root)
+    by_pid = {p["pid"]: p for p in procs}
+    assert set(by_pid) == {100, 200}  # only comm=='claude'; kworker ignored
+    assert by_pid[100]["is_daemon"] is False
+    assert by_pid[200]["is_daemon"] is True
+    assert agents == {"sess-1": [{"pid": 300, "name": "explorer", "type": "Explore", "model": "opus-4-8"}]}
+
+    # collect_agents=False skips subagent detection but still classifies the daemon.
+    procs2, agents2 = detect.scan_proc(collect_agents=False, proc_root=root)
+    assert agents2 == {}
+    assert {p["pid"] for p in procs2} == {100, 200}
+    assert {p["pid"]: p["is_daemon"] for p in procs2} == {100: False, 200: True}
+
+
+def test_scan_cache_keyed_on_collect_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two calls <1s apart with different collect_agents must not share a snapshot:
+    # the second (False) must not be served the first's agent-bearing result.
+    agents = {"sess-1": [{"pid": 42, "name": "x", "type": None, "model": None}]}
+
+    def fake_scan_proc(collect_agents: bool = True, proc_root: object = None) -> object:
+        procs = [{"pid": 1, "elapsed": 10, "start_unix": 0.0, "starttime": 0}]
+        return procs, (agents if collect_agents else {})
+
+    monkeypatch.setattr(detect, "scan_proc", fake_scan_proc)
+    monkeypatch.setattr(detect, "get_cwd", lambda pid: "/tmp/proj")
+    monkeypatch.setattr(detect, "get_env", lambda pid: {})
+    monkeypatch.setattr(
+        detect, "get_session_state", lambda *a, **k: ("working", 5, "Task", None, None, "sess-1")
+    )
+    assert detect.scan_sessions(True)[0]["agents"] == agents["sess-1"]
+    assert detect.scan_sessions(False)[0]["agents"] == []  # not the cached True snapshot
+
+
+def test_main_refuses_insecure_bind(monkeypatch: pytest.MonkeyPatch) -> None:
+    # main() logs startup (incl. show_agents) then aborts a non-loopback bind with no
+    # auth before ever starting uvicorn.
+    import main
+
+    monkeypatch.setattr(main.settings, "host", "0.0.0.0")
+    monkeypatch.setattr(main.settings, "auth_token", "")
+    monkeypatch.setattr(main.settings, "allow_insecure_bind", False)
+    with pytest.raises(SystemExit):
+        main.main()
+
+
+def test_scan_proc_no_proc_root() -> None:
+    # Missing /proc (no uptime) → empty, never raises.
+    assert detect.scan_proc(proc_root=Path("/nonexistent-proc")) == ([], {})
+
+
+def test_get_session_state_from_registry_and_jsonl(tmp_path: Path) -> None:
+    # End-to-end over the real parsers: a config-dir instance routes registry and
+    # transcript under tmp_path. Asserts state (from registry), context % + tool
+    # (from JSONL), last_activity (from statusUpdatedAt) and the session_id return.
+
+    pid, starttime, cwd = 1234, 42, "/tmp/proj"
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / f"{pid}.json").write_text(
+        json.dumps(
+            {
+                "procStart": starttime,
+                "sessionId": "sess-1",
+                "status": "busy",
+                "cwd": cwd,
+                "statusUpdatedAt": 1_700_000_000_000,
+            }
+        )
+    )
+    # Claude slugifies the cwd (every non-alphanumeric → '-'): "/tmp/proj" → "-tmp-proj".
+    proj = tmp_path / "projects" / "-tmp-proj"
+    proj.mkdir(parents=True)
+    (proj / "sess-1.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4-8",
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 1000, "cache_read_input_tokens": 9000},
+                    "content": [{"type": "tool_use", "name": "Bash"}],
+                },
+            }
+        )
+        + "\n"
+    )
+
+    state, ctx, tool, topic, last_activity, session_id = detect.get_session_state(
+        pid, cwd, starttime, config_dir=str(tmp_path)
+    )
+    assert state == "working"  # registry status 'busy' → working
+    assert ctx == 1  # 10_000 / 1_000_000 (opus → 1M window) → 1%
+    assert tool == "Bash"
+    assert topic is None  # no ai-title / last-prompt line
+    assert last_activity == 1_700_000_000.0  # statusUpdatedAt ms → s
+    assert session_id == "sess-1"
+
+
+def test_get_session_state_stale_registry_ignored(tmp_path: Path) -> None:
+    # procStart mismatch (PID reuse) → registry ignored; no JSONL either → idle, no id.
+
+    pid = 1234
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / f"{pid}.json").write_text(
+        json.dumps({"procStart": 999, "sessionId": "stale", "status": "busy"})
+    )
+    state, ctx, tool, topic, last_activity, session_id = detect.get_session_state(
+        pid, "/tmp/nope", starttime=42, config_dir=str(tmp_path)
+    )
+    assert state == "idle"
+    assert session_id is None
+
+
+async def test_sessions_route_forwards_show_agents(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The route must pass settings.show_agents through to scan_sessions verbatim.
+    import main
+
+    captured: dict[str, bool] = {}
+
+    def fake(collect_agents: bool = True) -> list[object]:
+        captured["v"] = collect_agents
+        return []
+
+    monkeypatch.setattr(main.settings, "show_agents", False)
+    monkeypatch.setattr(detect, "scan_sessions", fake)
+    r = await client.get("/api/sessions")
+    assert r.status_code == 200
+    assert captured["v"] is False
+
+
+def test_argv_value() -> None:
+    assert detect._argv_value(["--model", "opus"], "--model") == "opus"
+    assert detect._argv_value(["--model", ""], "--model") is None  # empty → None
+    assert detect._argv_value(["--model"], "--model") is None  # last position → None
+    assert detect._argv_value(["x", "y"], "--model") is None  # absent → None
 
 
 async def test_index_serves_filter_controls(client: httpx.AsyncClient) -> None:
@@ -99,6 +322,8 @@ async def test_index_serves_filter_controls(client: httpx.AsyncClient) -> None:
         'id="opt-sort"',
         'id="opt-idle"',
         'id="opt-topic"',
+        'id="opt-agents"',
+        'id="opt-daemons"',
         'id="opt-cards"',
         'id="settings-btn"',
         ".controls[hidden]",

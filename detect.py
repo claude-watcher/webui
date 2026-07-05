@@ -31,35 +31,109 @@ _STATUS_MAP = {
 }
 
 
-def get_claude_processes() -> list[dict[str, Any]]:
-    """Enumerate 'claude' processes via /proc — no `ps` fork per scan."""
+def _argv_value(argv: list[str], flag: str) -> str | None:
+    """Value following `flag` in a NUL-split cmdline, else None.
+
+    Empty value → None (`or None`). Flag absent or in last position → None.
+    """
     try:
-        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        return argv[argv.index(flag) + 1] or None
+    except ValueError, IndexError:
+        return None
+
+
+def scan_proc(
+    collect_agents: bool = True, proc_root: Path = Path("/proc")
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Single /proc pass → ('claude' sessions, subagents grouped by parent session id).
+
+    One walk feeds both consumers instead of two. An interactive session runs
+    comm=='claude'; a launched subagent (Task/swarm) runs the versioned binary
+    (comm != 'claude', invisible to the comm filter) and is spotted by its exact
+    argv tokens `--agent-id` / `--parent-session-id` — exact token match on the
+    NUL-split argv, so a substring buried in a larger argument can't false-positive.
+
+    `collect_agents=False` skips subagent detection entirely: no cmdline read for
+    non-'claude' processes → zero overhead (the reason it is togglable — with it on,
+    EVERY non-claude process's cmdline is read each scan). comm is read FIRST: a
+    cmdline read failure never loses a claude session. `proc_root` is injectable for
+    tests.
+
+    Security: the agent fields (name/type/model/pid) are UNTRUSTED process argv, not
+    an authenticated feed — any local process can forge --agent-id/--parent-session-id
+    to appear as a subagent of another session. Display only; never used for a
+    decision.
+    """
+    try:
+        uptime = float((proc_root / "uptime").read_text().split()[0])
     except Exception:
-        return []
+        return [], {}
     procs: list[dict[str, Any]] = []
-    for entry in Path("/proc").iterdir():
+    agents: dict[str, list[dict[str, Any]]] = {}
+    for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            if (entry / "comm").read_text().strip() != "claude":
-                continue
-            stat = (entry / "stat").read_text()
-            fields = stat[stat.rindex(")") + 2 :].split()
-            starttime = int(fields[19])
-            elapsed = int(uptime - starttime / _CLK_TCK)
-            start_unix = time.time() - elapsed
-        except Exception:
+            # comm is truncated to 15 chars (TASK_COMM_LEN); 'claude' fits. Read as
+            # bytes + decode(errors='ignore'): a non-UTF-8 comm (a name set via prctl
+            # by any process) would raise UnicodeDecodeError with read_text() — NOT
+            # an OSError → the scan would crash every tick.
+            comm = (entry / "comm").read_bytes().decode(errors="ignore").strip()
+        except OSError:
             continue
-        procs.append(
+        if comm == "claude":
+            try:
+                stat = (entry / "stat").read_text()
+                fields = stat[stat.rindex(")") + 2 :].split()
+                starttime = int(fields[19])
+                elapsed = int(uptime - starttime / _CLK_TCK)
+                start_unix = time.time() - elapsed
+            except Exception:
+                continue
+            # cmdline is read only to tell the daemon (`claude daemon run …`) from an
+            # interactive session; unreadable (racing an exec/exit) → treated as a
+            # non-daemon, so a session is never lost over it.
+            try:
+                argv = (entry / "cmdline").read_bytes().decode(errors="ignore").split("\x00")
+            except OSError:
+                argv = []
+            procs.append(
+                {
+                    "pid": int(entry.name),
+                    "elapsed": elapsed,
+                    "start_unix": start_unix,
+                    "starttime": starttime,
+                    "is_daemon": len(argv) > 1 and argv[1] == "daemon",
+                }
+            )
+            continue
+        if not collect_agents:
+            continue
+        # Subagent: comm != 'claude', so cmdline must be read to spot it.
+        try:
+            argv = (entry / "cmdline").read_bytes().decode(errors="ignore").split("\x00")
+        except OSError:
+            continue
+        if "--agent-id" not in argv:
+            continue
+        parent = _argv_value(argv, "--parent-session-id")
+        if not parent:
+            continue
+        # --agent-name may be missing (anonymous agents): fall back to the local part
+        # of the id (<name>@<team>).
+        name = _argv_value(argv, "--agent-name") or (_argv_value(argv, "--agent-id") or "?").split("@", 1)[0]
+        model = (_argv_value(argv, "--model") or "").removeprefix("claude-")
+        agents.setdefault(parent, []).append(
             {
                 "pid": int(entry.name),
-                "elapsed": elapsed,
-                "start_unix": start_unix,
-                "starttime": starttime,
+                "name": name,
+                "type": _argv_value(argv, "--agent-type"),
+                "model": model or None,
             }
         )
-    return procs
+    for lst in agents.values():
+        lst.sort(key=lambda a: a["name"])
+    return procs, agents
 
 
 def get_cwd(pid: int) -> str | None:
@@ -352,14 +426,15 @@ def get_session_state(
     cwd: str | None,
     starttime: int = 0,
     config_dir: str | None = None,
-) -> tuple[str, int | None, str | None, str | None, float | None]:
-    """Session state. Returns (state, context_pct, tool, topic, last_activity).
+) -> tuple[str, int | None, str | None, str | None, float | None, str | None]:
+    """Session state. Returns (state, context_pct, tool, topic, last_activity, session_id).
 
     The registry ~/.claude/sessions/<pid>.json (`status` field) wins when present;
     depending on the Claude Code version it may be absent, in which case state is
     derived from the JSONL. The JSONL always provides context % and current tool.
-    The registry's `sessionId`, when present, gives the exact JSONL path; else we
-    guess it by slugifying the cwd.
+    The registry's `sessionId`, when present, gives the exact JSONL path (else we
+    guess it by slugifying the cwd) and is returned so subagents can be attached to
+    their parent by `--parent-session-id`.
     """
     reg = get_session_registry(pid, starttime, config_dir)
     session_id = reg.get("sessionId") if reg else None
@@ -397,7 +472,7 @@ def get_session_state(
                 pass
     else:
         state = jsonl_state or "idle"
-    return state, context_pct, tool, topic, last_activity
+    return state, context_pct, tool, topic, last_activity, session_id
 
 
 def project_label(cwd: str | None) -> str:
@@ -407,6 +482,20 @@ def project_label(cwd: str | None) -> str:
     if len(parts) >= 2:
         return f"{parts[-2]}/{parts[-1]}"
     return parts[-1] if parts else "?"
+
+
+def resolve_config_dir(env: dict[str, str]) -> str | None:
+    """Absolute CLAUDE_CONFIG_DIR from a session's env, or None.
+
+    Expands a leading `~` (a quoted value is not shell-expanded) and rejects a
+    relative path: without the session's cwd it would resolve against the watcher's
+    cwd → registry/JSONL read from the wrong place. → default (None).
+    """
+    config_dir = env.get("CLAUDE_CONFIG_DIR") or None
+    if not config_dir:
+        return None
+    config_dir = os.path.expanduser(config_dir)
+    return config_dir if os.path.isabs(config_dir) else None
 
 
 def display_config_dir(path: str | None) -> str | None:
@@ -431,48 +520,73 @@ def display_config_dir(path: str | None) -> str | None:
 # serves that result to everyone for ~1s — bounding /proc cost regardless of fan-out.
 _SCAN_LOCK = threading.Lock()
 _SCAN_TTL = 1.0
-_scan_cache: tuple[float, list[dict[str, Any]]] | None = None
+# (timestamp, collect_agents, result). The flag is part of the key so a caller
+# passing a different value never gets served a snapshot built the other way.
+_scan_cache: tuple[float, bool, list[dict[str, Any]]] | None = None
 
 
-def scan_sessions() -> list[dict[str, Any]]:
+def scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
     """Read-only snapshot of every running Claude Code session.
 
     Display-only: no terminal/window resolution, no focus, no signalling. Sorted
     by state priority (waiting > working > idle), then project name. Thread-safe;
     result is cached for _SCAN_TTL seconds and shared across callers (read-only).
+    The cache is keyed on `collect_agents` too, so mixing values stays correct.
+
+    `collect_agents` (APP_SHOW_AGENTS) skips subagent detection when False, sparing
+    a cmdline read per non-claude process on busy hosts.
     """
     global _scan_cache
     with _SCAN_LOCK:
         now = time.time()
-        if _scan_cache is not None and now - _scan_cache[0] < _SCAN_TTL:
-            return _scan_cache[1]
-        result = _scan_sessions()
-        _scan_cache = (now, result)
+        if _scan_cache is not None and _scan_cache[1] == collect_agents and now - _scan_cache[0] < _SCAN_TTL:
+            return _scan_cache[2]
+        result = _scan_sessions(collect_agents)
+        _scan_cache = (now, collect_agents, result)
         return result
 
 
-def _scan_sessions() -> list[dict[str, Any]]:
+def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
     sessions: list[dict[str, Any]] = []
     # Single clock read for the whole scan → idle durations computed SERVER-side so
     # the page never depends on the viewer's wall clock (it may be a remote browser
     # whose clock is skewed vs this host).
     now = time.time()
-    for p in get_claude_processes():
+    # One /proc walk yields both the sessions and the subagents (keyed by their
+    # parent's session id) to attach below.
+    procs, agents = scan_proc(collect_agents)
+    for p in procs:
         pid = p["pid"]
         cwd = get_cwd(pid)
         env = get_env(pid)
+        config_dir = resolve_config_dir(env)
 
-        config_dir = env.get("CLAUDE_CONFIG_DIR") or None
-        if config_dir:
-            # CLAUDE_CONFIG_DIR inherited from the session env: expand `~` (quoted →
-            # not shell-expanded) and reject any relative path (without the
-            # session's cwd it would point at the watcher's cwd → registry/JSONL
-            # read from the wrong place). → default.
-            config_dir = os.path.expanduser(config_dir)
-            if not os.path.isabs(config_dir):
-                config_dir = None
+        # The daemon shares comm=='claude' but is not a stateful session (no
+        # terminal, no JSONL, no pid-keyed registry). Short-circuit the state
+        # resolver and emit a minimal row flagged `daemon` so the page can mark it
+        # (D) and render it neutral; hiding it is the client's call.
+        if p.get("is_daemon"):
+            sessions.append(
+                {
+                    "pid": pid,
+                    "project": project_label(cwd),
+                    "worktree": None,
+                    "display_cwd": cwd or "?",
+                    "cwd": cwd or "?",
+                    "topic": None,
+                    "state": "daemon",
+                    "context_pct": None,
+                    "tool": None,
+                    "elapsed": p["elapsed"],
+                    "idle_seconds": None,
+                    "config_dir": display_config_dir(config_dir),
+                    "agents": [],
+                    "daemon": True,
+                }
+            )
+            continue
 
-        state, context_pct, tool, topic, last_activity = get_session_state(
+        state, context_pct, tool, topic, last_activity, session_id = get_session_state(
             pid, cwd, p["starttime"], config_dir
         )
         # "Confirmed" worktree = marker detected AND transcript resolved
@@ -498,6 +612,10 @@ def _scan_sessions() -> list[dict[str, Any]]:
                 # yields a negative.
                 "idle_seconds": max(0, int(now - last_activity)) if last_activity is not None else None,
                 "config_dir": display_config_dir(config_dir),
+                # Subagents (Task/swarm) spawned by this session, matched on the
+                # registry sessionId == the child's --parent-session-id.
+                "agents": agents.get(session_id, []) if session_id else [],
+                "daemon": False,
             }
         )
     sessions.sort(key=lambda s: (s["state"] != "waiting", s["state"] != "working", s["project"].lower()))
