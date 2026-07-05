@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     # Explicit acknowledgement to bind a non-loopback host WITHOUT auth (e.g. a
     # container publishing to a trusted network). Off → such a bind is refused.
     allow_insecure_bind: bool = False
+    # Detect the subagents (Task/swarm) each session spawned and show them. On by
+    # default; turning it off spares a /proc/<pid>/cmdline read per NON-claude
+    # process on every scan — worth it on a host with thousands of processes.
+    show_agents: bool = True
     # Dev only: uvicorn auto-reload on edits + browser livereload on restart.
     reload: bool = False
 
@@ -87,7 +91,7 @@ async def health() -> dict[str, str]:
 # /healthz) when several browsers poll concurrently.
 @app.get("/api/sessions", dependencies=[Depends(require_auth)])
 def sessions() -> dict[str, Any]:
-    rows = detect.scan_sessions()
+    rows = detect.scan_sessions(settings.show_agents)
     return {
         "count": len(rows),
         "sessions": rows,
@@ -126,6 +130,7 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         auth_required=bool(settings.auth_token),
+        show_agents=settings.show_agents,
     )
 
     # Fail fast on an unsafe bind (non-loopback + no auth) unless explicitly allowed.

@@ -10,7 +10,7 @@ polls it. **Display only** — no terminal focus, no actions, no signalling.
 
 | File | Role |
 |---|---|
-| `detect.py` | Session detection backend, trimmed to read-only (no X11/window/kitty/focus/kill). Reads `/proc`, `~/.claude/sessions/<pid>.json` (registry) and the transcript `.jsonl`. |
+| `detect.py` | Session detection backend, trimmed to read-only (no X11/window/kitty/focus/kill). Reads `/proc`, `~/.claude/sessions/<pid>.json` (registry) and the transcript `.jsonl`. One `scan_proc()` walk finds both sessions and their subagents (comm≠`claude`, spotted by `--agent-id`/`--parent-session-id`), attached to each session's `agents[]`. The daemon (`claude daemon run …`) is emitted as a minimal `daemon:true` row (`state:"daemon"`); the page marks it `(D)` and can hide it. |
 | `auth.py` | Optional shared-secret gate (`X-API-Key` / `Bearer` / `?key=`). Open when `APP_AUTH_TOKEN` is empty. |
 | `main.py` | FastAPI app: `/healthz`, `/api/sessions` (guarded), `/api/meta` (open), `/` (the page). |
 | `static/index.html` | Single polling page, no build step, no external deps. |
@@ -22,7 +22,7 @@ hand if the upstream heuristics change.
 
 - `GET /healthz` → `{"status": "ok"}`
 - `GET /api/meta` → `{"auth_required": bool}` (always open; UI uses it to decide whether to prompt)
-- `GET /api/sessions` → `{count, sessions[], auth_required, dev, instance}` (guarded when a token is set; `dev`/`instance` are livereload internals)
+- `GET /api/sessions` → `{count, sessions[], auth_required, dev, instance}` (guarded when a token is set; `dev`/`instance` are livereload internals). Each session carries `agents[]` (`{pid, name, type, model}` per spawned subagent).
 
 ## Run
 

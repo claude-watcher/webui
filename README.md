@@ -17,7 +17,9 @@ terminal focus, no actions, no signalling.
 
 `dev`/`instance` are livereload internals (`dev` true only under `APP_RELOAD`; the
 page reloads itself when `instance` changes). Each entry in `sessions[]` carries
-`project`, `state`, `context_pct`, `tool`, `topic`, `idle_seconds` and friends.
+`project`, `state`, `context_pct`, `tool`, `topic`, `idle_seconds`, `agents[]`
+(the subagents it spawned — `{pid, name, type, model}` each) and `daemon` (true for
+the `claude daemon`, which is not a real session) among others.
 
 ## Auth (optional)
 
@@ -41,6 +43,8 @@ is unchanged:
 | sort | `default` / `idle` | `default` keeps the server order (waiting → working → idle, then project); `idle` floats the most-recently-idle sessions to the top of the idle group |
 | idle | `none` / `loose` / `precise` | idle duration shown on idle rows: hidden, `[Nd ]HH:MM`, or `[Nd ]HH:MM:SS` |
 | topic | on / off | show the AI title / last prompt under each session |
+| agents | on / off | show the count of subagents each session spawned (hover for the list) |
+| daemons | on / off | show the `claude daemon` row (marked `(D)`); off hides it |
 | cards | on / off | roomier spacing between rows |
 
 The bar itself is hidden on every load (not persisted). Idle durations are
@@ -57,7 +61,10 @@ APP_AUTH_TOKEN=hunter2 make run   # require a key
 
 Config is via `APP_*` env vars / `.env` (see `.env.example`): `APP_HOST`,
 `APP_PORT`, `APP_LOG_LEVEL`, `APP_JSON_LOGS`, `APP_AUTH_TOKEN`,
-`APP_ALLOW_INSECURE_BIND`, `APP_RELOAD`.
+`APP_ALLOW_INSECURE_BIND`, `APP_RELOAD`, `APP_SHOW_AGENTS`. Set
+`APP_SHOW_AGENTS=false` to skip subagent detection — it spares a
+`/proc/<pid>/cmdline` read per non-`claude` process on each scan, worth it on a host
+with thousands of processes.
 
 ### Bind safety
 

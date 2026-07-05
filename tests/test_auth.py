@@ -16,7 +16,7 @@ async def secured_client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[httpx
 
     monkeypatch.setenv("APP_AUTH_TOKEN", "s3cret")
     main = importlib.reload(main_mod)
-    monkeypatch.setattr(main.detect, "scan_sessions", lambda: [])
+    monkeypatch.setattr(main.detect, "scan_sessions", lambda *a, **k: [])
 
     transport = httpx.ASGITransport(app=main.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
