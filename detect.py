@@ -159,7 +159,7 @@ def get_env(pid: int) -> dict[str, str]:
     try:
         return dict(
             kv.split("=", 1)
-            for kv in Path(f"/proc/{pid}/environ").read_bytes().decode().split("\x00")
+            for kv in Path(f"/proc/{pid}/environ").read_bytes().decode(errors="replace").split("\x00")
             if "=" in kv
         )
     except Exception:

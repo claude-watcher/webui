@@ -449,6 +449,15 @@ async def test_api_rows_carry_the_entrypoint(
     assert {by_pid[s["pid"]]: s["entrypoint"] for s in body["sessions"]} == _ENTRYPOINT_EXPECTED
 
 
+def test_get_env_survives_a_non_utf8_byte(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """005-AC2: one non-UTF-8 byte elsewhere in environ must not empty the dict (entrypoint lost)."""
+    environ = tmp_path / "proc" / "7" / "environ"
+    environ.parent.mkdir(parents=True)
+    environ.write_bytes(b"\0".join([b"LANG=\xff\xfe", b"CLAUDE_CODE_ENTRYPOINT=sdk-ts", b"X=caf\xe9"]))
+    monkeypatch.setattr(detect, "Path", lambda p: tmp_path / Path(p).relative_to("/"))
+    assert detect.get_env(7)["CLAUDE_CODE_ENTRYPOINT"] == "sdk-ts"
+
+
 def test_get_session_state_from_registry_and_jsonl(tmp_path: Path) -> None:
     # End-to-end over the real parsers: a config-dir instance routes registry and
     # transcript under tmp_path. Asserts state (from registry), context % + tool
