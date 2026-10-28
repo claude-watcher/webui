@@ -225,6 +225,14 @@ def test_scan_proc_classifies_sessions_daemon_and_agents(tmp_path: Path) -> None
     _write_proc(root, 100, "claude", b"/usr/bin/claude\x00")  # interactive session
     _write_proc(root, 200, "claude", b"/usr/bin/claude\x00daemon\x00run\x00")  # daemon
     _write_proc(root, 400, "kworker", b"", with_stat=False)  # kernel thread → ignored
+    # Helper modes: dropped at argv[1] only, where the binary dispatches them.
+    _write_proc(root, 600, "claude", b"/home/u/.local/bin/claude\x00--chrome-native-host\x00")
+    _write_proc(
+        root, 601, "claude", b"/usr/bin/claude\x00--append-system-prompt\x00see --chrome-native-host\x00"
+    )
+    _write_proc(root, 602, "claude", b"/usr/bin/claude\x00--claude-in-chrome-mcp\x00")
+    _write_proc(root, 603, "claude", b"/usr/bin/claude\x00--eval-mock-server\x00")
+    _write_proc(root, 604, "claude", b"/usr/bin/claude\x00-c\x00--chrome-native-host\x00")
     _write_proc(  # subagent: comm != claude, spotted by argv tokens
         root,
         300,
@@ -236,7 +244,7 @@ def test_scan_proc_classifies_sessions_daemon_and_agents(tmp_path: Path) -> None
 
     procs, agents = detect.scan_proc(proc_root=root)
     by_pid = {p["pid"]: p for p in procs}
-    assert set(by_pid) == {100, 200}  # only comm=='claude'; kworker ignored
+    assert set(by_pid) == {100, 200, 601, 604}  # only comm=='claude'; kworker and helper modes ignored
     assert by_pid[100]["is_daemon"] is False
     assert by_pid[200]["is_daemon"] is True
     assert agents == {"sess-1": [{"pid": 300, "name": "explorer", "type": "Explore", "model": "opus-4-8"}]}
@@ -244,8 +252,8 @@ def test_scan_proc_classifies_sessions_daemon_and_agents(tmp_path: Path) -> None
     # collect_agents=False skips subagent detection but still classifies the daemon.
     procs2, agents2 = detect.scan_proc(collect_agents=False, proc_root=root)
     assert agents2 == {}
-    assert {p["pid"] for p in procs2} == {100, 200}
-    assert {p["pid"]: p["is_daemon"] for p in procs2} == {100: False, 200: True}
+    assert {p["pid"] for p in procs2} == {100, 200, 601, 604}
+    assert {p["pid"]: p["is_daemon"] for p in procs2} == {100: False, 200: True, 601: False, 604: False}
 
 
 def test_scan_cache_keyed_on_collect_agents(monkeypatch: pytest.MonkeyPatch) -> None:

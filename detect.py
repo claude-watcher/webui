@@ -42,6 +42,10 @@ def _argv_value(argv: list[str], flag: str) -> str | None:
         return None
 
 
+# Helper modes of the `claude` binary, dispatched on argv[1]: never a session.
+_HELPER_MODES = frozenset({"--chrome-native-host", "--claude-in-chrome-mcp", "--eval-mock-server"})
+
+
 def scan_proc(
     collect_agents: bool = True, proc_root: Path = Path("/proc")
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
@@ -61,7 +65,8 @@ def scan_proc(
 
     Ephemeral headless runs are skipped: exact token `--no-session-persistence` plus a
     print-mode token (`-p`/`--print`/`--output-format[=]`/`--input-format[=]`) — the
-    flag is ignored interactively. Unreadable cmdline → still listed.
+    flag is ignored interactively. Unreadable cmdline → still listed. The binary's helper
+    modes (`_HELPER_MODES` at argv[1], e.g. Chrome bridge, Chrome MCP server) are skipped too.
 
     Security: the agent fields (name/type/model/pid) are UNTRUSTED process argv, not
     an authenticated feed — any local process can forge --agent-id/--parent-session-id
@@ -101,6 +106,9 @@ def scan_proc(
                 argv = (entry / "cmdline").read_bytes().decode(errors="ignore").split("\x00")
             except OSError:
                 argv = []
+            # argv[1] only: that is where the binary dispatches its helper modes.
+            if len(argv) > 1 and argv[1] in _HELPER_MODES:
+                continue
             # Headless ephemeral run: no transcript to watch (see docstring).
             if "--no-session-persistence" in argv and any(
                 a in ("-p", "--print", "--output-format", "--input-format")
