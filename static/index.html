@@ -127,6 +127,7 @@
     <label><input type="checkbox" id="opt-topic"> topic</label>
     <label><input type="checkbox" id="opt-agents"> agents</label>
     <label><input type="checkbox" id="opt-daemons"> daemons</label>
+    <label><input type="checkbox" id="opt-sdk"> sdk</label>
     <label><input type="checkbox" id="opt-cards"> cards</label>
   </div>
 </header>
@@ -148,7 +149,7 @@ const $gear = document.getElementById("settings-btn");
 // Display preferences — per-browser, mirroring the TUI's options. Defaults match
 // the TUI: alpha sort, idle duration hidden, topic shown, flat (non-card) layout.
 const PREFS_KEY = "ccw_prefs";
-const PREFS_DEFAULT = { sort: "default", idle: "none", topic: true, agents: true, daemons: true, cards: false };
+const PREFS_DEFAULT = { sort: "default", idle: "none", topic: true, agents: true, daemons: true, sdk: false, cards: false };
 function loadPrefs() {
   const p = { ...PREFS_DEFAULT };
   let stored = {};
@@ -242,6 +243,18 @@ function sortSessions(sessions) {
   return arr;
 }
 
+// The daemon is not a session; hiding it and SDK sessions is a client-side filter
+// (mirrors the TUI/GTK 'hide daemons' / 'hide SDK sessions').
+function isShown(s) {
+  if (s.daemon) return prefs.daemons;
+  return prefs.sdk || !(typeof s.entrypoint === "string" && s.entrypoint.startsWith("sdk-"));
+}
+// Every session filtered out is not the same as none running.
+function emptyText(total) {
+  if (!total) return "No running Claude Code sessions.";
+  return total + (total === 1 ? " session" : " sessions") + " hidden by the filters.";
+}
+
 function authHeaders() {
   const t = localStorage.getItem(TOKEN_KEY);
   return t ? { "X-API-Key": t } : {};
@@ -297,21 +310,20 @@ function renderSessions(data) {
   $dot.classList.remove("stale");
   $gear.hidden = false;
   syncPanel();
-  // The daemon is not a session; hiding it is a client-side filter (mirrors the
-  // TUI/GTK 'hide daemons'). Count reflects what's shown.
-  const list = prefs.daemons ? data.sessions : data.sessions.filter((s) => !s.daemon);
+  // Count reflects what's shown.
+  const list = data.sessions.filter(isShown);
   $meta.textContent = list.length + (list.length === 1 ? " session" : " sessions")
     + " · " + new Date().toLocaleTimeString();
   $main.classList.toggle("cards", prefs.cards);
   if (!list.length) {
-    $main.innerHTML = '<div class="empty">No running Claude Code sessions.</div>';
+    $main.innerHTML = '<div class="empty">' + esc(emptyText(data.sessions.filter((s) => !s.daemon).length)) + '</div>';
     return;
   }
   $main.innerHTML = sortSessions(list).map(rowHtml).join("");
 }
 
-// Reflect saved prefs into the controls and wire change handlers: the four prefs
-// persist to localStorage and re-render the last payload; the ⚙ button toggles the
+// Reflect saved prefs into the controls and wire change handlers: the prefs persist
+// to localStorage and re-render the last payload; the ⚙ button toggles the
 // (non-persisted) filter-bar visibility.
 function initControls() {
   const sort = document.getElementById("opt-sort");
@@ -319,18 +331,19 @@ function initControls() {
   const topic = document.getElementById("opt-topic");
   const agents = document.getElementById("opt-agents");
   const daemons = document.getElementById("opt-daemons");
+  const sdk = document.getElementById("opt-sdk");
   const cards = document.getElementById("opt-cards");
   sort.value = prefs.sort; idle.value = prefs.idle;
   topic.checked = prefs.topic; agents.checked = prefs.agents;
-  daemons.checked = prefs.daemons; cards.checked = prefs.cards;
+  daemons.checked = prefs.daemons; sdk.checked = prefs.sdk; cards.checked = prefs.cards;
   const apply = () => {
     prefs.sort = sort.value; prefs.idle = idle.value;
     prefs.topic = topic.checked; prefs.agents = agents.checked;
-    prefs.daemons = daemons.checked; prefs.cards = cards.checked;
+    prefs.daemons = daemons.checked; prefs.sdk = sdk.checked; prefs.cards = cards.checked;
     savePrefs();
     if (lastData) renderSessions(lastData);
   };
-  [sort, idle, topic, agents, daemons, cards].forEach((el) => el.addEventListener("change", apply));
+  [sort, idle, topic, agents, daemons, sdk, cards].forEach((el) => el.addEventListener("change", apply));
   $gear.addEventListener("click", () => { panelOpen = !panelOpen; syncPanel(); });
 }
 

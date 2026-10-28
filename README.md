@@ -26,8 +26,10 @@ the response was sent.
 `dev`/`instance` are livereload internals (`dev` true only under `APP_RELOAD`; the
 page reloads itself when `instance` changes). Each entry in `sessions[]` carries
 `project`, `state`, `bg_shell`, `context_pct`, `tool`, `topic`, `idle_seconds`, `agents[]`
-(the subagents it spawned — `{pid, name, type, model}` each, `pid` null for an in-process `Agent`-tool subagent) and `daemon` (true for
-the `claude daemon`, which is not a real session) among others.
+(the subagents it spawned — `{pid, name, type, model}` each, `pid` null for an in-process `Agent`-tool subagent), `daemon` (true for
+the `claude daemon`, which is not a real session) and `entrypoint` (the raw `CLAUDE_CODE_ENTRYPOINT`
+of the process, `null` when absent, empty or unreadable: e.g. `sdk-ts` for an Agent SDK session such as T3 Code,
+`claude-vscode`, `cli`; never interpreted server-side) among others.
 Ephemeral headless `claude` runs (`--no-session-persistence` in print mode, e.g. T3 Code
 title generation) have no transcript and are never listed.
 
@@ -97,6 +99,7 @@ is unchanged:
 | topic | on / off | show the AI title / last prompt under each session |
 | agents | on / off | show the count of subagents each session spawned (hover for the list) |
 | daemons | on / off | show the `claude daemon` row (marked `(D)`); off hides it |
+| sdk | off / on | show Agent SDK sessions (`entrypoint` starting with `sdk-`, e.g. T3 Code); off (default) hides them |
 | cards | on / off | roomier spacing between rows |
 
 The bar itself is hidden on every load (not persisted). Idle durations are

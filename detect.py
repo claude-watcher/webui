@@ -159,7 +159,7 @@ def get_env(pid: int) -> dict[str, str]:
     try:
         return dict(
             kv.split("=", 1)
-            for kv in Path(f"/proc/{pid}/environ").read_bytes().decode().split("\x00")
+            for kv in Path(f"/proc/{pid}/environ").read_bytes().decode(errors="replace").split("\x00")
             if "=" in kv
         )
     except Exception:
@@ -943,6 +943,8 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
         cwd = get_cwd(pid)
         env = get_env(pid)
         config_dir = resolve_config_dir(env)
+        # Raw launcher name (`sdk-ts`, `cli`…): reported as-is, each client applies its own rule.
+        entrypoint = env.get("CLAUDE_CODE_ENTRYPOINT") or None
 
         # The daemon shares comm=='claude' but is not a stateful session (no
         # terminal, no JSONL, no pid-keyed registry). Short-circuit the state
@@ -966,6 +968,7 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
                     "config_dir": display_config_dir(config_dir),
                     "agents": [],
                     "daemon": True,
+                    "entrypoint": entrypoint,
                 }
             )
             continue
@@ -1008,6 +1011,7 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
                 if collect_agents
                 else [],
                 "daemon": False,
+                "entrypoint": entrypoint,
             }
         )
     # Only AVAILABILITY ranks here (waiting > working > idle). A background shell
