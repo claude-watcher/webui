@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -400,6 +401,54 @@ async def test_api_feed_never_lists_ephemeral_run(
     assert [s["pid"] for s in r.json()["sessions"]] == [pids["interactive"]]
 
 
+# name → (argv, env). get_env stays stubbed: it hard-codes /proc.
+_ENTRYPOINT_CASES: dict[str, tuple[list[str], dict[str, str]]] = {
+    "sdk": (["claude"], {"CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}),
+    "absent": (["claude"], {}),
+    "empty": (["claude"], {"CLAUDE_CODE_ENTRYPOINT": ""}),
+    "cli": (["claude"], {"CLAUDE_CODE_ENTRYPOINT": "cli"}),
+    "daemon": (["claude", "daemon", "run"], {"CLAUDE_CODE_ENTRYPOINT": "sdk-py"}),
+}
+_ENTRYPOINT_EXPECTED = {"sdk": "sdk-ts", "absent": None, "empty": None, "cli": "cli", "daemon": "sdk-py"}
+
+
+def _entrypoint_proc_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[int, str]:
+    """Fake /proc read by the real scan_proc; returns pid → case name."""
+    pids = _fake_proc_root(tmp_path, {name: argv for name, (argv, _) in _ENTRYPOINT_CASES.items()})
+    by_pid = {pid: name for name, pid in pids.items()}
+    real_scan_proc = detect.scan_proc
+    monkeypatch.setattr(
+        detect, "scan_proc", lambda collect_agents=True: real_scan_proc(collect_agents, proc_root=tmp_path)
+    )
+    monkeypatch.setattr(detect, "get_cwd", lambda pid: "/tmp/proj")
+    monkeypatch.setattr(detect, "get_env", lambda pid: _ENTRYPOINT_CASES[by_pid[pid]][1])
+    monkeypatch.setattr(
+        detect, "get_session_state", lambda *a, **k: ("idle", None, None, None, None, None, False)
+    )
+    return by_pid
+
+
+def test_every_row_carries_the_raw_entrypoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """005-AC2: raw CLAUDE_CODE_ENTRYPOINT on every row (daemon included), None when absent or empty."""
+    by_pid = _entrypoint_proc_root(monkeypatch, tmp_path)
+    rows = detect.scan_sessions()
+    assert {by_pid[r["pid"]]: r["entrypoint"] for r in rows} == _ENTRYPOINT_EXPECTED
+    assert len(rows) == len(_ENTRYPOINT_CASES)  # nothing dropped because of it
+    assert [r["daemon"] for r in rows if by_pid[r["pid"]] == "daemon"] == [True]
+
+
+async def test_api_rows_carry_the_entrypoint(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """005-AC2: /api/sessions serves `entrypoint` (value or null) on every row, none filtered out."""
+    by_pid = _entrypoint_proc_root(monkeypatch, tmp_path)
+    r = await client.get("/api/sessions")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == len(_ENTRYPOINT_CASES)
+    assert {by_pid[s["pid"]]: s["entrypoint"] for s in body["sessions"]} == _ENTRYPOINT_EXPECTED
+
+
 def test_get_session_state_from_registry_and_jsonl(tmp_path: Path) -> None:
     # End-to-end over the real parsers: a config-dir instance routes registry and
     # transcript under tmp_path. Asserts state (from registry), context % + tool
@@ -674,6 +723,9 @@ async def test_index_serves_filter_controls(client: httpx.AsyncClient) -> None:
         assert needle in html, needle
 
 
+_PAGE = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
+
+
 def _run_page_js(snippet: str) -> str:
     """Execute a snippet against the page's own JS, via node. Returns stdout.
 
@@ -684,7 +736,7 @@ def _run_page_js(snippet: str) -> str:
     started being. Extracting the two functions and running them under node is the
     cheapest thing that turns that class of drift into a red test.
     """
-    page = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
+    page = _PAGE
     # Pull the two functions verbatim out of the page — no second copy to drift.
     start = page.index("const esc =")
     end = page.index("function renderSessions", start)
@@ -693,7 +745,9 @@ def _run_page_js(snippet: str) -> str:
         [
             "node",
             "-e",
-            src + "\nconst prefs={sort:'idle',topic:true,agents:true,idle:'loose',daemons:true};\n" + snippet,
+            src
+            + "\nconst prefs={sort:'idle',topic:true,agents:true,idle:'loose',daemons:true,sdk:false};\n"
+            + snippet,
         ],
         capture_output=True,
         text=True,
@@ -744,6 +798,122 @@ def test_page_bucket_order_matches_the_server() -> None:
     )
     # Same priority as detect.scan_sessions' sort and both native clients.
     assert out == "0,1,2,2", out
+
+
+def _need_node() -> None:
+    if not shutil.which("node"):
+        if os.getenv("CI"):
+            pytest.fail("node is required to run the page-JS tests in CI")
+        pytest.skip("node not installed")
+
+
+_PAGE_ROWS = """[
+  {id:'sdk-ts', entrypoint:'sdk-ts'}, {id:'sdk-py', entrypoint:'sdk-py'}, {id:'null', entrypoint:null},
+  {id:'cli', entrypoint:'cli'}, {id:'claude-vscode', entrypoint:'claude-vscode'},
+  {id:'x-sdk-y', entrypoint:'x-sdk-y'}, {id:'missing'}, {id:'daemon', daemon:true},
+  {id:'daemon-sdk', daemon:true, entrypoint:'sdk-ts'},
+]"""
+
+
+@pytest.mark.parametrize(
+    ("sdk", "daemons", "shown"),
+    [
+        (False, True, "null,cli,claude-vscode,x-sdk-y,missing,daemon,daemon-sdk"),
+        (True, True, "sdk-ts,sdk-py,null,cli,claude-vscode,x-sdk-y,missing,daemon,daemon-sdk"),
+        (False, False, "null,cli,claude-vscode,x-sdk-y,missing"),
+        (True, False, "sdk-ts,sdk-py,null,cli,claude-vscode,x-sdk-y,missing"),
+    ],
+)
+def test_page_filters_sdk_sessions(sdk: bool, daemons: bool, shown: str) -> None:
+    """005-AC7: `sdk` off hides `sdk-*` entrypoints only, rows without one stay.
+
+    A daemon obeys `daemons` alone, whatever its entrypoint.
+    """
+    _need_node()
+    flags = f"{{sdk:{str(sdk).lower()}, daemons:{str(daemons).lower()}}}"
+    out = _run_page_js(
+        f"Object.assign(prefs, {flags});\nconsole.log({_PAGE_ROWS}.filter(isShown).map(r => r.id).join(','));"
+    )
+    assert out == shown
+
+
+# DOM stubs: just what renderSessions touches, so the real function runs under node.
+_DOM_STUB = """
+const _el = () => ({hidden: false, innerHTML: '', textContent: '', setAttribute() {},
+  classList: {add() {}, remove() {}, toggle() {}}});
+const _els = {};
+const document = {getElementById: (id) => (_els[id] ??= _el())};
+const localStorage = {getItem: () => null, setItem() {}};
+"""
+
+
+def _render_page(prefs: dict[str, bool], sessions: str) -> dict[str, object]:
+    """Run the page's own renderSessions on `sessions` (a JS array literal); return what it drew."""
+    script = _PAGE[_PAGE.index("<script>") + len("<script>") : _PAGE.index("function initControls")]
+    snippet = f"""
+Object.assign(prefs, {json.dumps(prefs)});
+const _row = (o) => ({{pid: 1, project: 'p', state: 'idle', elapsed: 1, cwd: '/p', ...o}});
+renderSessions({{sessions: {sessions}.map(_row)}});
+const html = _els.main.innerHTML;
+const empty = html.match(/<div class="empty">([^<]*)<\\/div>/);
+console.log(JSON.stringify({{
+  rows: (html.match(/class="row"/g) || []).length,
+  meta: _els.meta.textContent.split(' · ')[0],
+  empty: empty ? empty[1] : null,
+}}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", _DOM_STUB + script + snippet], capture_output=True, text=True, timeout=30
+    )
+    assert proc.returncode == 0, proc.stderr
+    result: dict[str, object] = json.loads(proc.stdout)
+    return result
+
+
+_SDK, _CLI, _DAEMON = "{entrypoint: 'sdk-ts'}", "{entrypoint: 'cli'}", "{daemon: true}"
+
+
+@pytest.mark.parametrize(
+    ("sdk", "daemons", "sessions", "rows", "meta", "empty"),
+    [
+        (False, True, [_SDK, _CLI, _DAEMON], 2, "2 sessions", None),
+        (True, True, [_SDK, _CLI, _DAEMON], 3, "3 sessions", None),
+        (False, True, [_CLI], 1, "1 session", None),
+        (False, True, [_SDK, _SDK], 0, "0 sessions", "2 sessions hidden by the filters."),
+        (False, False, [_SDK, _DAEMON], 0, "0 sessions", "1 session hidden by the filters."),
+        (True, False, [_DAEMON], 0, "0 sessions", "No running Claude Code sessions."),
+        (True, True, [], 0, "0 sessions", "No running Claude Code sessions."),
+    ],
+)
+def test_page_renders_only_shown_sessions(
+    sdk: bool, daemons: bool, sessions: list[str], rows: int, meta: str, empty: str | None
+) -> None:
+    """005-AC7: rows and count are the shown ones; all filtered out reads as hidden, not as none running.
+
+    The daemon is not a session: it never counts as a hidden one.
+    """
+    _need_node()
+    drawn = _render_page({"sdk": sdk, "daemons": daemons}, "[" + ", ".join(sessions) + "]")
+    assert drawn == {"rows": rows, "meta": meta, "empty": empty}
+
+
+def test_page_sdk_pref_defaults_off_and_is_wired_like_daemons() -> None:
+    """005-AC7: `sdk` defaults to false, has its checkbox and is loaded/saved/listened to like `daemons`."""
+    defaults = re.search(r"const PREFS_DEFAULT = \{([^}]*)\}", _PAGE)
+    assert defaults and re.search(r"\bsdk:\s*false\b", defaults.group(1)), "sdk pref missing or not false"
+    assert re.search(r'<input type="checkbox" id="opt-sdk">\s*sdk</label>', _PAGE)
+    controls = _PAGE[_PAGE.index("function initControls") :]
+    controls = controls[: controls.index("\n}\n")]
+    for daemons_form in (
+        'const daemons = document.getElementById("opt-daemons")',
+        "daemons.checked = prefs.daemons",
+        "prefs.daemons = daemons.checked",
+    ):
+        assert daemons_form in controls, daemons_form
+        assert daemons_form.replace("daemons", "sdk") in controls, daemons_form.replace("daemons", "sdk")
+    listeners = re.search(r"\[([^\]]*)\]\.forEach\(\(el\) => el\.addEventListener\(\"change\"", controls)
+    assert listeners
+    assert {"daemons", "sdk"} <= {n.strip() for n in listeners.group(1).split(",")}
 
 
 def _git_worktree_checkout(tmp_path: Path, gitdir: str) -> Path:
