@@ -58,6 +58,7 @@ SHARED_CONSTANTS = [
     "DEFAULT_CONTEXT_WINDOW",
     "_AGENT_HANDBACK_TOOL",
     "_AGENT_INTERRUPTED",
+    "_HELPER_MODES",
 ]
 
 # Fonctions PURES (aucune lecture de /proc ni de disque) appelables à l'identique

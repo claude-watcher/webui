@@ -32,6 +32,8 @@ of the process, `null` when absent, empty or unreadable: e.g. `sdk-ts` for an Ag
 `claude-vscode`, `cli`; never interpreted server-side) among others.
 Ephemeral headless `claude` runs (`--no-session-persistence` in print mode, e.g. T3 Code
 title generation) have no transcript and are never listed.
+Neither are the binary's helper modes (e.g. Chrome bridge `--chrome-native-host`, Chrome MCP
+server `--claude-in-chrome-mcp`).
 
 `state` is one of:
 
